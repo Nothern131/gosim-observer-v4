@@ -215,17 +215,27 @@ class Planner:
                  f"{self.requests[request_id]['min_completed']} to >= {self.requests[request_id]['threshold']}")
 
     def request_urgency(self, i: int, now: datetime) -> float:
-        """Extra value for a target that belongs to an unmet observation_request.
-        Grows as the deadline nears so the scheduler finishes the request's targets in time."""
+        """Extra value for a target that belongs to an unmet observation_request: the marginal
+        share of the reward over the targets the request still needs, times deadline slack.
+        Sits at the same scale as request_value so it competes fairly with regular targets;
+        it only matters in the final days when the request cannot be finished otherwise."""
         best = 0.0
         for req in self.requests.values():
             if i not in req["target_ids"]:
                 continue
-            if self._request_done(req) >= req["min_completed"]:
+            done = self._request_done(req)
+            if done >= req["min_completed"]:
                 continue  # this request is already going to pay; no urgency needed
-            hours_left = (req["deadline"] - now).total_seconds() / 3600.0 if req.get("deadline") else 24.0
-            scale = 1.0 + max(0.0, min(2.0, 6.0 - hours_left / 4.0))  # 1.0 far out -> up to 3.0 urgent
-            best = max(best, req["reward"] * scale)
+            if req.get("deadline"):
+                hours_left = max(0.25, (req["deadline"] - now).total_seconds() / 3600.0)
+            else:
+                hours_left = 24.0
+            if hours_left <= 0.25:
+                continue  # expired request: no reward left to chase
+            progress = done / max(1, req["min_completed"])
+            slack = hours_left / 72.0  # 72h = two average request windows -> full pressure
+            scale = 1.0 + min(12.0, 12.0 * (1.0 - progress) * max(0.5, 1.0 - slack))
+            best = max(best, req["reward"] / max(1, req["min_completed"] - done) * scale)
         return best
 
     def _close_request(self, message: dict) -> None:
@@ -245,21 +255,31 @@ class Planner:
     def request_value(self, i: int, now: datetime) -> float:
         """Points-per-exposure this target is worth for an unmet observation_request: the flat
         reward split over the targets the request still needs, times a deadline pressure that
-        climbs sharply as the deadline nears. Regular targets carry no deadline, so a request must
-        win their slots before it expires or its reward is lost for good."""
+        climbs as the deadline nears. Regular targets carry no deadline, so a request must win
+        their slots before it expires or its reward is lost for good. The pressure uses progress
+        against the deadline: just after issue the request still has all its nights, so its
+        targets compete with regular work at the value of their reward share; the same target
+        costs nothing to keep warm in its final hours before the deadline."""
         best = 0.0
         for req in self.requests.values():
             if i not in req["target_ids"]:
                 continue
             need = req["min_completed"]
-            if self._request_done(req) >= need:
+            done = self._request_done(req)
+            if done >= need:
                 continue
             if req.get("deadline"):
                 hours_left = max(0.25, (req["deadline"] - now).total_seconds() / 3600.0)
             else:
                 hours_left = 24.0
-            push = 1.0 + min(12.0, 60.0 / hours_left)  # 48h -> 2.4x, 24h -> 3.5x, 12h -> 6x, <=5h -> 13x
-            best = max(best, req["reward"] / max(1, need) * push)
+            # an expired request pays nothing: it must not keep drawing the regular slot
+            # supply that could go to required or uniform-coverage work
+            if hours_left <= 0.25:
+                continue
+            progress = min(1.0, done / max(1, need))
+            slack = hours_left / 72.0  # 72h = two average request windows -> full pressure already
+            pressure = 1.0 + min(15.0, 15.0 * max(0.0, 1.0 - progress) * max(0.5, 1.0 - slack))
+            best = max(best, req["reward"] / max(1, need) * pressure)
         return best
 
     def _resync(self, message: dict) -> None:
@@ -314,6 +334,11 @@ class Planner:
             self.factor[i] = max(self.factor[i], min(1.0, factor))
             if self.required[i] and self.factor[i] < 0.5:
                 self.attempts[i] += 1  # not enough yet: lower its priority a little for next time
+            elif i in self.request_targets and self.factor[i] < 0.5:
+                # a request target that misses the threshold must stay schedulable at full value
+                # through the rest of the request window -- damping it would let the request expire
+                # unfulfilled, and the flat reward is lost for good.
+                self.attempts[i] = 0
             if factor < 0.97:
                 ratio = factor * self.f0t0 / (self.flux[i] * self.pending_duration * prediction["model"])
                 self.samples.append((hours, ratio))
