@@ -55,6 +55,8 @@ CLOSED_KINDS = {"rain", "storm"}
 BLOCKING_KINDS = {"terrain_obstruction", "rocket_launch"}
 DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0, "SW": 225.0, "W": 270.0, "NW": 315.0}
 REQUIRED_MISS_SOFTEN = 0.8    # damp multiplier for required targets: less aggressive so faint ones stay in pool longer
+REQUEST_BONUS = 100.0          # planning value of completing an observation_request target (each request pays 100 for >= min_completed)
+REQUEST_DONE_FACTOR = 0.5     # below this, a request target is still worth keeping in the pool; above it the flat reward is locked in
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -118,6 +120,8 @@ class Planner:
         self.terrain: set[str] = set()
         self.extra_avoid: set[str] = set()       # directions an advisor asked to avoid tonight
         self.duration_scale = 1.0
+        self.requests: dict[str, dict] = {}      # request_id -> {target_ids, min_completed, threshold, reward, deadline}
+        self.request_targets: set[int] = set()    # all targets mentioned by any live observation_request
         self.fast_level = 0
 
     # --- precomputation --------------------------------------------------------------------------
@@ -180,9 +184,71 @@ class Planner:
                         self.terrain.add(notice.get("direction", ""))
             elif kind == "state_resync":
                 self._resync(message)
+            elif kind == "observation_request":
+                self._register_request(message)
         bulletin = latest_bulletin or {}
         self.notices = {(n.get("event_kind", ""), n.get("direction", "")) for n in bulletin.get("notices", [])
                         if n.get("event_kind") != "terrain_obstruction"}
+
+    def _register_request(self, message: dict) -> None:
+        """An observation_request pays a flat reward once >= min_completed of its targets reach the
+        factor threshold. Register it so the scheduler stops skipping those targets."""
+        request_id = message.get("request_id")
+        target_ids = message.get("target_ids", [])
+        if not request_id or not target_ids:
+            return
+        # store local indices, not raw ids: request_urgency/value/_finish_plan all work on indices
+        indices = [self.index_of[tid] for tid in target_ids if tid in self.index_of]
+        if not indices:
+            return
+        self.requests[request_id] = {
+            "target_ids": indices,
+            "min_completed": int(message.get("minimum_completed", 6)),
+            "threshold": float(message.get("completion_factor_threshold", 0.5)),
+            "reward": float(message.get("completion_reward", 100.0)),
+            "deadline": parse_utc(message["deadline_utc"]) if message.get("deadline_utc") else None,
+        }
+        self.request_targets.update(indices)
+        self.log(f"observation_request {request_id}: {len(target_ids)} targets, need "
+                 f"{self.requests[request_id]['min_completed']} to >= {self.requests[request_id]['threshold']}")
+
+    def request_urgency(self, i: int, now: datetime) -> float:
+        """Extra value for a target that belongs to an unmet observation_request.
+        Grows as the deadline nears so the scheduler finishes the request's targets in time."""
+        best = 0.0
+        for req in self.requests.values():
+            if i not in req["target_ids"]:
+                continue
+            if self._request_done(req) >= req["min_completed"]:
+                continue  # this request is already going to pay; no urgency needed
+            hours_left = (req["deadline"] - now).total_seconds() / 3600.0 if req.get("deadline") else 24.0
+            scale = 1.0 + max(0.0, min(2.0, 6.0 - hours_left / 4.0))  # 1.0 far out -> up to 3.0 urgent
+            best = max(best, req["reward"] * scale)
+        return best
+
+    def _request_done(self, req: dict) -> int:
+        """How many of a request's targets are already past its factor threshold."""
+        return sum(1 for j in req["target_ids"] if self.factor[j] >= req["threshold"])
+
+    def request_value(self, i: int, now: datetime) -> float:
+        """Points-per-exposure this target is worth for an unmet observation_request: the flat
+        reward split over the targets the request still needs, times a deadline pressure that
+        climbs sharply as the deadline nears. Regular targets carry no deadline, so a request must
+        win their slots before it expires or its reward is lost for good."""
+        best = 0.0
+        for req in self.requests.values():
+            if i not in req["target_ids"]:
+                continue
+            need = req["min_completed"]
+            if self._request_done(req) >= need:
+                continue
+            if req.get("deadline"):
+                hours_left = max(0.5, (req["deadline"] - now).total_seconds() / 3600.0)
+            else:
+                hours_left = 24.0
+            push = 1.0 + min(8.0, 96.0 / hours_left)   # 48h -> 3x, 24h -> 5x, <=12h -> 9x
+            best = max(best, req["reward"] / max(1, need) * push)
+        return best
 
     def _resync(self, message: dict) -> None:
         """Part of the recent data was lost: restart the factor estimates from the engine's best scores."""
@@ -340,7 +406,12 @@ class Planner:
             # but it brings no realistic bonus — don't inflate its priority.
             reachable = self.hmax[i] > 0.0
             return (self.weight[i] * (1.0 - f * f) + (REQUIRED_BONUS if reachable else 0.0) * (1.0 if f < 0.5 else 0.35)) * damp
-        return 0.0 if f >= DONE_FACTOR else self.weight[i] * (1.0 - f * f) * damp
+        base = 0.0 if f >= DONE_FACTOR else self.weight[i] * (1.0 - f * f) * damp
+        # A target named by a live observation_request is worth its share of the flat reward:
+        # completing it can earn up to REQUEST_BONUS, so keep it in the pool even when faint.
+        if i in self.request_targets and f < REQUEST_DONE_FACTOR:
+            base += REQUEST_BONUS * (1.0 if f < 0.5 else 0.3)
+        return base
 
     def plan(self, now: datetime, night_end: datetime, night_index: int, hours: float):
         """Return an observe action dict, or None when nothing useful is up."""
@@ -365,6 +436,11 @@ class Planner:
             if -h <= ha and ha + min_visible <= h:
                 nights_left = max(1, self.last_night[i] - night_index + 1)
                 setting = 1.0 + 0.5 * max(0.0, ha / h) if h < 180 else 1.0
+                # deadline pressure: a target inside an unmet observation_request gets a
+                # multiplier that climbs as its deadline nears, so the scheduler finishes it in time
+                urg = self.request_urgency(i, now)
+                if urg:
+                    v += urg * (1.0 + 2.0 / nights_left)
                 candidates.append((v * (1.0 + 2.0 / nights_left) * setting, i))
         self.active = still_active
         if not candidates:
@@ -395,6 +471,10 @@ class Planner:
                 gain = self.weight[i] * max(0.0, reach * reach - f * f)
                 if self.required[i] and f < 0.5 and reach >= 0.5:
                     gain += REQUIRED_BONUS
+                if i in self.request_targets and f < REQUEST_DONE_FACTOR and reach >= 0.5:
+                    # an unmet observation_request pays a flat reward; its deadline-scaled share is
+                    # what makes a faint request target beat a regular target for an anchor slot
+                    gain += self.request_value(i, now)
                 req_damp = REQUIRED_MISS_SOFTEN ** self.misses[i] if self.required[i] else 0.6 ** self.misses[i]
                 achievable_cache[i] = gain * req_damp * 0.7 ** self.attempts[i] * self._direction_factor(alt, az)
             return achievable_cache[i]
@@ -493,9 +573,12 @@ class Planner:
         # Required targets crossing the 0.5 scorer threshold are worth extra exposure:
         # for each assigned required target still below 0.5, compute the exposure that would
         # push it over 0.5 and raise the duration to cover it (capped by what is left up).
+        # observation_request targets get the same treatment: their flat reward only pays
+        # once the factor clears the 0.5 threshold, so a short exposure is wasted.
         for item in info.values():
             i = item["i"]
-            if not self.required[i] or self.factor[i] >= 0.5 or item["k"] <= 0:
+            want_05 = self.required[i] or (i in self.request_targets and self.factor[i] < 0.5)
+            if not want_05 or self.factor[i] >= 0.5 or item["k"] <= 0:
                 continue
             need = 0.5 / item["k"]
             if need > self.factor[i]:
