@@ -334,11 +334,6 @@ class Planner:
             self.factor[i] = max(self.factor[i], min(1.0, factor))
             if self.required[i] and self.factor[i] < 0.5:
                 self.attempts[i] += 1  # not enough yet: lower its priority a little for next time
-            elif i in self.request_targets and self.factor[i] < 0.5:
-                # a request target that misses the threshold must stay schedulable at full value
-                # through the rest of the request window -- damping it would let the request expire
-                # unfulfilled, and the flat reward is lost for good.
-                self.attempts[i] = 0
             if factor < 0.97:
                 ratio = factor * self.f0t0 / (self.flux[i] * self.pending_duration * prediction["model"])
                 self.samples.append((hours, ratio))
