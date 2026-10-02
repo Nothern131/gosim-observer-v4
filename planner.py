@@ -186,6 +186,8 @@ class Planner:
                 self._resync(message)
             elif kind == "observation_request":
                 self._register_request(message)
+            elif kind == "observation_request_result":
+                self._close_request(message)
         bulletin = latest_bulletin or {}
         self.notices = {(n.get("event_kind", ""), n.get("direction", "")) for n in bulletin.get("notices", [])
                         if n.get("event_kind") != "terrain_obstruction"}
@@ -225,6 +227,16 @@ class Planner:
             scale = 1.0 + max(0.0, min(2.0, 6.0 - hours_left / 4.0))  # 1.0 far out -> up to 3.0 urgent
             best = max(best, req["reward"] * scale)
         return best
+
+    def _close_request(self, message: dict) -> None:
+        """Settled or expired request: drop it so its targets stop drawing extra exposure.
+        An expired request never pays, and keeping it would waste the rest of the survey."""
+        request_id = message.get("request_id")
+        if self.requests.pop(request_id, None) is None:
+            return
+        self.request_targets = {i for req in self.requests.values() for i in req["target_ids"]}
+        self.log(f"observation_request {request_id} closed: status={message.get('status')} "
+                 f"delta={message.get('score_delta')}")
 
     def _request_done(self, req: dict) -> int:
         """How many of a request's targets are already past its factor threshold."""
