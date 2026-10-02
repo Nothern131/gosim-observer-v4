@@ -255,10 +255,10 @@ class Planner:
             if self._request_done(req) >= need:
                 continue
             if req.get("deadline"):
-                hours_left = max(0.5, (req["deadline"] - now).total_seconds() / 3600.0)
+                hours_left = max(0.25, (req["deadline"] - now).total_seconds() / 3600.0)
             else:
                 hours_left = 24.0
-            push = 1.0 + min(8.0, 96.0 / hours_left)   # 48h -> 3x, 24h -> 5x, <=12h -> 9x
+            push = 1.0 + min(12.0, 60.0 / hours_left)  # 48h -> 2.4x, 24h -> 3.5x, 12h -> 6x, <=5h -> 13x
             best = max(best, req["reward"] / max(1, need) * push)
         return best
 
@@ -407,7 +407,7 @@ class Planner:
                 factor = min(factor, 0.2)
         return factor
 
-    def value(self, i: int) -> float:
+    def value(self, i: int, now: datetime) -> float:
         f = self.factor[i]
         damp = REQUIRED_MISS_SOFTEN ** self.misses[i] if self.required[i] else 0.6 ** self.misses[i]
         if self.required[i]:
@@ -417,12 +417,16 @@ class Planner:
             # the altitude limit every night) still costs the 50-point penalty,
             # but it brings no realistic bonus — don't inflate its priority.
             reachable = self.hmax[i] > 0.0
-            return (self.weight[i] * (1.0 - f * f) + (REQUIRED_BONUS if reachable else 0.0) * (1.0 if f < 0.5 else 0.35)) * damp
+            out = (self.weight[i] * (1.0 - f * f) + (REQUIRED_BONUS if reachable else 0.0) * (1.0 if f < 0.5 else 0.35)) * damp
+            # deadline pressure for a required target named by a live request: rides the achievable
+            # layer (see achievable()), NOT value() -- value() is the anchor formula's denominator,
+            # so adding urgency here would cancel the achievable lift instead of amplifying it.
+            return out
         base = 0.0 if f >= DONE_FACTOR else self.weight[i] * (1.0 - f * f) * damp
-        # A target named by a live observation_request is worth its share of the flat reward:
-        # completing it can earn up to REQUEST_BONUS, so keep it in the pool even when faint.
+        # A target named by a live observation_request is worth its share of the flat reward
+        # (deadline-scaled so it wins slots before the request expires).
         if i in self.request_targets and f < REQUEST_DONE_FACTOR:
-            base += REQUEST_BONUS * (1.0 if f < 0.5 else 0.3)
+            base += self.request_value(i, now)
         return base
 
     def plan(self, now: datetime, night_end: datetime, night_index: int, hours: float):
@@ -439,7 +443,7 @@ class Planner:
         still_active = []
         candidates = []
         for i in self.active:
-            v = self.value(i)
+            v = self.value(i, now)
             if v <= 0.0:
                 continue
             still_active.append(i)
@@ -448,11 +452,6 @@ class Planner:
             if -h <= ha and ha + min_visible <= h:
                 nights_left = max(1, self.last_night[i] - night_index + 1)
                 setting = 1.0 + 0.5 * max(0.0, ha / h) if h < 180 else 1.0
-                # deadline pressure: a target inside an unmet observation_request gets a
-                # multiplier that climbs as its deadline nears, so the scheduler finishes it in time
-                urg = self.request_urgency(i, now)
-                if urg:
-                    v += urg * (1.0 + 2.0 / nights_left)
                 candidates.append((v * (1.0 + 2.0 / nights_left) * setting, i))
         self.active = still_active
         if not candidates:
@@ -483,10 +482,16 @@ class Planner:
                 gain = self.weight[i] * max(0.0, reach * reach - f * f)
                 if self.required[i] and f < 0.5 and reach >= 0.5:
                     gain += REQUIRED_BONUS
-                if i in self.request_targets and f < REQUEST_DONE_FACTOR and reach >= 0.5:
+                if i in self.request_targets and f < REQUEST_DONE_FACTOR and up > 0:
                     # an unmet observation_request pays a flat reward; its deadline-scaled share is
-                    # what makes a faint request target beat a regular target for an anchor slot
+                    # what makes a faint request target beat a regular target for an anchor slot.
+                    # "up > 0" not "reach >= 0.5": the flat reward is worth any exposure before the
+                    # deadline, even if the sky is too dark for one visit to clear the threshold.
                     gain += self.request_value(i, now)
+                    # urgency rides the anchor ranking: the anchor-weighted = achievable * priority / value
+                    # formula cancels anything that only appears in value(), so the deadline pressure
+                    # must also raise achievable, or the scheduler still parks on a 60-point regular.
+                    gain += self.request_urgency(i, now)
                 req_damp = REQUIRED_MISS_SOFTEN ** self.misses[i] if self.required[i] else 0.6 ** self.misses[i]
                 achievable_cache[i] = gain * req_damp * 0.7 ** self.attempts[i] * self._direction_factor(alt, az)
             return achievable_cache[i]
@@ -495,7 +500,7 @@ class Planner:
         for checked, (priority, i) in enumerate(candidates):
             if checked >= ANCHOR_POOL and len(anchors) >= 3 * ANCHORS:
                 break
-            weighted = achievable(i) * priority / max(1e-9, self.value(i))  # keep the urgency terms
+            weighted = achievable(i) * priority / max(1e-9, self.value(i, now))  # keep the urgency terms
             if weighted > 0:
                 anchors.append((weighted, i))
         if not anchors:
