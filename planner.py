@@ -57,6 +57,11 @@ DIRECTION_AZ = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0, "SW": 
 REQUIRED_MISS_SOFTEN = 0.8    # damp multiplier for required targets: less aggressive so faint ones stay in pool longer
 REQUEST_BONUS = 100.0          # planning value of completing an observation_request target (each request pays 100 for >= min_completed)
 REQUEST_DONE_FACTOR = 0.5     # below this, a request target is still worth keeping in the pool; above it the flat reward is locked in
+REQUIRED_RESCUE = 135.0       # late-survey bonus for a faint required target the median sky cannot cross but the best sky seen could
+REQUIRED_RESCUE_NIGHTS = 3    # ... ramped in over the last this many nights (zero before that)
+REQUEST_CHASE = False         # master switch for observation_request pressure. Measured on practice alpha:
+                              # chasing RQ1 costs ~-733 net (reward +100), RQ2 is unreachable under the
+                              # platform's in-window rule (2/6), so chasing is net-negative on this card.
 
 
 def _az_distance(a: float, b: float) -> float:
@@ -108,6 +113,7 @@ class Planner:
         self.prior_scale = 1.0                   # long-run median, used when recent samples are missing
         self.samples: deque = deque(maxlen=24)   # (hours, ratio) of recent unsaturated hits
         self.all_ratios: deque = deque(maxlen=400)
+        self.best_ratio = 0.0                    # best sky ratio ever seen (running max: the deque can roll over)
         self.clean_history: list[tuple[float, int, float]] = []   # (hours since start, night, quality ratio)
         self.pending_night = -1
         self.band_checks: deque = deque(maxlen=60)    # (program declared, matched?, model) from saturated hits
@@ -219,6 +225,8 @@ class Planner:
         share of the reward over the targets the request still needs, times deadline slack.
         Sits at the same scale as request_value so it competes fairly with regular targets;
         it only matters in the final days when the request cannot be finished otherwise."""
+        if not REQUEST_CHASE:
+            return 0.0
         best = 0.0
         for req in self.requests.values():
             if i not in req["target_ids"]:
@@ -260,6 +268,8 @@ class Planner:
         against the deadline: just after issue the request still has all its nights, so its
         targets compete with regular work at the value of their reward share; the same target
         costs nothing to keep warm in its final hours before the deadline."""
+        if not REQUEST_CHASE:
+            return 0.0
         best = 0.0
         for req in self.requests.values():
             if i not in req["target_ids"]:
@@ -336,6 +346,7 @@ class Planner:
                 self.attempts[i] += 1  # not enough yet: lower its priority a little for next time
             if factor < 0.97:
                 ratio = factor * self.f0t0 / (self.flux[i] * self.pending_duration * prediction["model"])
+                self.best_ratio = max(self.best_ratio, ratio)
                 self.samples.append((hours, ratio))
                 self.all_ratios.append(ratio)
                 if prediction["clean"]:
@@ -427,6 +438,25 @@ class Planner:
                 factor = min(factor, 0.2)
         return factor
 
+    def _rescue_bonus(self, i: int, model: float, available: float) -> float:
+        """Late-survey rescue for a faint required target.
+
+        The planner decides with the *median* sky of the last two hours, so a faint required
+        target whose 0.5 threshold needs the best sky of the whole survey looks unreachable the
+        entire night (no +60 lift, achievable ~ 0) and is crowded out by regular science until
+        the survey ends. In the final nights it gets a large ramped bonus -- but only when the
+        best ratio actually seen so far, applied to tonight's geometry, could cross 0.5; a target
+        impossible even under the best sky would only waste pointings.
+        """
+        if self.best_ratio <= 0.0:
+            return 0.0
+        best_k = self.flux[i] * model * self.best_ratio * PLAN_FACTOR_SAFETY / self.f0t0
+        if min(1.0, best_k * available) < 0.5:
+            return 0.0
+        nights_left = max(1, len(self.nights) - self.night_index)
+        ramp = min(1.0, max(0.0, (REQUIRED_RESCUE_NIGHTS - nights_left + 1) / REQUIRED_RESCUE_NIGHTS))
+        return REQUIRED_RESCUE * ramp
+
     def value(self, i: int, now: datetime) -> float:
         f = self.factor[i]
         damp = REQUIRED_MISS_SOFTEN ** self.misses[i] if self.required[i] else 0.6 ** self.misses[i]
@@ -497,11 +527,15 @@ class Planner:
                     self.q0 * normalized_airmass(max(alt, 1.0)) ** self.airmass_exponent)
                 k = self.flux[i] * model * self.scale * PLAN_FACTOR_SAFETY / self.f0t0
                 up = (self.hmax[i] - wrap180(lst - self.ra[i])) / SIDEREAL_DEG_PER_SECOND if self.hmax[i] < 180 else 1e9
-                reach = min(1.0, k * min(self.max_exposure, up, seconds_left))
+                available = min(self.max_exposure, up, seconds_left)
+                reach = min(1.0, k * available)
                 f = self.factor[i]
                 gain = self.weight[i] * max(0.0, reach * reach - f * f)
-                if self.required[i] and f < 0.5 and reach >= 0.5:
-                    gain += REQUIRED_BONUS
+                if self.required[i] and f < 0.5:
+                    if reach >= 0.5:
+                        gain += REQUIRED_BONUS
+                    elif up > 0:
+                        gain += self._rescue_bonus(i, model, available)
                 if i in self.request_targets and f < REQUEST_DONE_FACTOR and up > 0:
                     # an unmet observation_request pays a flat reward; its deadline-scaled share is
                     # what makes a faint request target beat a regular target for an anchor slot.
@@ -614,7 +648,7 @@ class Planner:
         # once the factor clears the 0.5 threshold, so a short exposure is wasted.
         for item in info.values():
             i = item["i"]
-            want_05 = self.required[i] or (i in self.request_targets and self.factor[i] < 0.5)
+            want_05 = self.required[i] or (REQUEST_CHASE and i in self.request_targets and self.factor[i] < 0.5)
             if not want_05 or self.factor[i] >= 0.5 or item["k"] <= 0:
                 continue
             need = 0.5 / item["k"]
